@@ -8,6 +8,7 @@ use std::hash::Hash;
 use std::io::{BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -84,17 +85,32 @@ impl Peer {
     }
 
     fn broadcast(&mut self, msg: &MessageBlock) -> Result<(), std::io::Error> {
-        let mut broken_connections = Vec::new();
-        for node in &self.connections {
+        let broken_connections = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+
+        for node in self.connections.clone() {
             if node.address != self.address {
-                match self.send_message(node, msg) {
-                    Ok(_) => (),
-                    Err(_) => {
-                        broken_connections.push(node.clone());
+                let broken_connections = Arc::clone(&broken_connections);
+                let msg = msg.clone();
+                let node_clone = node.clone();
+                let peer = self.clone();
+                let handle = thread::spawn(move || {
+                    if let Err(_) = peer.send_message(&node_clone, &msg) {
+                        let mut broken = broken_connections.lock().unwrap();
+                        broken.push(node_clone);
                     }
-                }
+                });
+
+                handles.push(handle);
             }
         }
+        for handle in handles {
+            handle.join().expect("send thread panicked");
+        }
+        let broken_connections = Arc::try_unwrap(broken_connections)
+            .unwrap()
+            .into_inner()
+            .unwrap();
         for item in broken_connections {
             self.connections.remove(&item);
         }
@@ -145,10 +161,11 @@ impl Peer {
     }
 }
 
-fn listen(peer: Arc<Mutex<Peer>>) -> Result<(), std::io::Error> {
-    let addr = peer.lock().unwrap().address;
+fn listen(peer: Arc<Mutex<Peer>>, tx: mpsc::Sender<()>) -> Result<(), std::io::Error> {
+    let addr = peer.lock().unwrap().address.clone();
     let listener = TcpListener::bind(&peer.lock().unwrap().address)?;
     info!("My address is {addr}");
+    tx.send(()).expect("Failed to notify");
 
     for stream in listener.incoming() {
         let mut stream = stream?;
@@ -196,6 +213,7 @@ fn main() {
         .init();
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
     let args = Args::parse();
+    let (tx, rx) = mpsc::channel();
 
     let peer = Arc::new(Mutex::new(Peer::new(args.port, DEFAULT_TIMEOUT)));
     let mut handles = Vec::new();
@@ -205,11 +223,12 @@ fn main() {
     handles.push(handle);
 
     let peer_listener = Arc::clone(&peer);
-    let handle = thread::spawn(move || listen(peer_listener));
+    let handle = thread::spawn(move || listen(peer_listener, tx));
     handles.push(handle);
 
     let peer_init = Arc::clone(&peer);
     let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+        rx.recv().unwrap();
         let peer = peer_init.lock().unwrap();
         if let Some(conn) = &args.connect {
             let addr = conn.parse().expect("parse connection string");
