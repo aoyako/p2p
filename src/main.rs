@@ -1,4 +1,7 @@
 use clap::Parser;
+use env_logger::Env;
+use log::info;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -74,10 +77,7 @@ impl Peer {
     fn new(port: u16, timeout: Duration) -> Peer {
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         Peer {
-            connections: HashSet::from([
-                Node::new(address),
-                Node::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9888)),
-            ]),
+            connections: HashSet::from([Node::new(address)]),
             address: address,
             timeout: timeout,
         }
@@ -137,10 +137,18 @@ impl Peer {
     fn notify_join(&mut self, addr: &SocketAddr) {
         self.connections.replace(Node::new(addr.clone()));
     }
+
+    fn generate_message(&self) -> String {
+        let mut rng = rand::thread_rng();
+        let rnum: i32 = rng.gen_range(0..=100);
+        rnum.to_string()
+    }
 }
 
 fn listen(peer: Arc<Mutex<Peer>>) -> Result<(), std::io::Error> {
+    let addr = peer.lock().unwrap().address;
     let listener = TcpListener::bind(&peer.lock().unwrap().address)?;
+    info!("My address is {addr}");
 
     for stream in listener.incoming() {
         let mut stream = stream?;
@@ -151,9 +159,9 @@ fn listen(peer: Arc<Mutex<Peer>>) -> Result<(), std::io::Error> {
 
         let mut peer = peer.lock().unwrap();
         match req {
-            MessageBlock::Info(from, data) => println!("received {data} from {from}"),
+            MessageBlock::Info(from, data) => info!("Received message [{data}] from {from}"),
             MessageBlock::RequestPeerList(from) => peer.joined(&from)?,
-            MessageBlock::UpdatePeerList(from, peers_data) => peer.update_connections(&peers_data),
+            MessageBlock::UpdatePeerList(_, peers_data) => peer.update_connections(&peers_data),
             MessageBlock::PeerJoined(from) => peer.notify_join(&from),
         }
     }
@@ -166,32 +174,53 @@ fn talk(peer: Arc<Mutex<Peer>>, period: u64) -> Result<(), std::io::Error> {
     loop {
         thread::sleep(interval_duration);
         let mut peer = peer.lock().unwrap();
-        println!("Sending message [msg] to {:?}", peer.list_addresses());
+        let msg = peer.generate_message();
+
+        let peer_list: Vec<_> = peer
+            .list_addresses()
+            .iter()
+            .cloned()
+            .filter(|addr| addr != &peer.address)
+            .collect();
+
+        info!("Sending message [{msg}] to {peer_list:?}");
+
         let adress = peer.address.clone();
-        peer.broadcast(&MessageBlock::Info(adress, "hello!".to_string()))?;
+        peer.broadcast(&MessageBlock::Info(adress, msg))?;
     }
 }
 
 fn main() {
+    env_logger::Builder::from_env(Env::default().default_filter_or("info"))
+        .format_timestamp_secs()
+        .init();
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
     let args = Args::parse();
 
-    let mut peer = Arc::new(Mutex::new(Peer::new(args.port, DEFAULT_TIMEOUT)));
+    let peer = Arc::new(Mutex::new(Peer::new(args.port, DEFAULT_TIMEOUT)));
+    let mut handles = Vec::new();
 
     let peer_sender = Arc::clone(&peer);
-    thread::spawn(move || talk(peer_sender, u64::from(args.period)));
+    let handle = thread::spawn(move || talk(peer_sender, u64::from(args.period)));
+    handles.push(handle);
 
     let peer_listener = Arc::clone(&peer);
-    thread::spawn(move || listen(peer_listener).expect("listen"));
+    let handle = thread::spawn(move || listen(peer_listener));
+    handles.push(handle);
 
-    {
-        let peer = peer.lock().unwrap();
+    let peer_init = Arc::clone(&peer);
+    let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+        let peer = peer_init.lock().unwrap();
         if let Some(conn) = &args.connect {
-            let addr = conn.parse().expect("initial peer connect");
-            peer.ask_connections(&addr).expect("initial peer connect");
-            println!("Connected to {conn}")
+            let addr = conn.parse().expect("parse connection string");
+            peer.ask_connections(&addr)?;
+            info!("Connected to {conn}");
         }
-    }
+        Ok(())
+    });
+    handles.push(handle);
 
-    thread::sleep(Duration::from_secs(10000));
+    for handle in handles {
+        let _ = handle.join().expect("Thread panicked");
+    }
 }
