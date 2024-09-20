@@ -66,7 +66,7 @@ impl Peer {
         }
     }
 
-    fn broadcast(&mut self, msg: &MessageBlock) -> Result<(), std::io::Error> {
+    fn broadcast(&mut self, msg: &MessageBlock) -> Result<(), Box<dyn std::error::Error>> {
         let broken_connections = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::new();
 
@@ -87,12 +87,9 @@ impl Peer {
             }
         }
         for handle in handles {
-            handle.join().expect("send thread panicked");
+            handle.join().unwrap();
         }
-        let broken_connections = Arc::try_unwrap(broken_connections)
-            .unwrap()
-            .into_inner()
-            .unwrap();
+        let broken_connections = Arc::try_unwrap(broken_connections).unwrap().into_inner()?;
         for item in broken_connections {
             self.connections.remove(&item);
         }
@@ -122,7 +119,7 @@ impl Peer {
         Ok(())
     }
 
-    pub fn joined(&mut self, addr: &SocketAddr) -> Result<(), std::io::Error> {
+    pub fn joined(&mut self, addr: &SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         self.notify_join(addr);
         self.connections.replace(Node::new(addr.clone()));
         self.send_connections(addr)?;
@@ -143,7 +140,7 @@ impl Peer {
     }
 }
 
-pub fn talk(peer: Arc<Mutex<Peer>>, period: u64) -> Result<(), std::io::Error> {
+pub fn talk(peer: Arc<Mutex<Peer>>, period: u64) -> Result<(), Box<dyn std::error::Error>> {
     let interval_duration = Duration::from_secs(period);
     loop {
         thread::sleep(interval_duration);
@@ -164,11 +161,14 @@ pub fn talk(peer: Arc<Mutex<Peer>>, period: u64) -> Result<(), std::io::Error> {
     }
 }
 
-pub fn listen(peer: Arc<Mutex<Peer>>, tx: mpsc::Sender<()>) -> Result<(), std::io::Error> {
+pub fn listen(
+    peer: Arc<Mutex<Peer>>,
+    tx: mpsc::Sender<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let addr = peer.lock().unwrap().address.clone();
     let listener = TcpListener::bind(&peer.lock().unwrap().address)?;
     info!("My address is {addr}");
-    tx.send(()).expect("Failed to notify");
+    tx.send(())?;
 
     for stream in listener.incoming() {
         let mut stream = stream?;

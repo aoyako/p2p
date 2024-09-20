@@ -37,23 +37,22 @@ fn main() {
     let mut handles = Vec::new();
 
     let peer_sender = Arc::clone(&peer);
-    let handle = thread::spawn(move || talk(peer_sender, u64::from(args.period)));
+    let handle = thread::spawn(move || talk(peer_sender, u64::from(args.period)).expect("talk"));
     handles.push(handle);
 
     let peer_listener = Arc::clone(&peer);
-    let handle = thread::spawn(move || listen(peer_listener, tx));
+    let handle = thread::spawn(move || listen(peer_listener, tx).expect("listen"));
     handles.push(handle);
 
     let peer_init = Arc::clone(&peer);
-    let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+    let handle = thread::spawn(move || {
         rx.recv().unwrap();
         let peer = peer_init.lock().unwrap();
         if let Some(conn) = &args.connect {
             let addr = conn.parse().expect("parse connection string");
-            peer.ask_connections(&addr)?;
+            peer.ask_connections(&addr).expect("connect");
             info!("Connected to {conn}");
         }
-        Ok(())
     });
     handles.push(handle);
 
