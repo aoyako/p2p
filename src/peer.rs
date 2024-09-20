@@ -2,9 +2,10 @@ use log::info;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::hash::Hash;
 use std::io::{BufReader, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -12,72 +13,92 @@ use std::thread;
 use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-enum MessageBlock {
-    UpdatePeerList(SocketAddr, HashSet<Node>),
-    RequestPeerList(SocketAddr),
-    Info(SocketAddr, String),
-    PeerJoined(SocketAddr),
+pub enum MessageBlock<T: NodeSender> {
+    UpdatePeerList(T, HashSet<T>),
+    RequestPeerList(T),
+    Info(T, String),
+    PeerJoined(T),
 }
 
 #[derive(Eq, Hash, PartialEq, Serialize, Deserialize, Debug, Clone)]
-struct Node {
+pub struct Node {
     address: SocketAddr,
-}
-
-impl Node {
-    fn new(addr: SocketAddr) -> Node {
-        Node { address: addr }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Peer {
-    address: SocketAddr,
-    connections: HashSet<Node>,
     timeout: Duration,
 }
 
-impl Peer {
-    pub fn list_addresses(&self) -> Vec<SocketAddr> {
-        self.connections.iter().map(|node| node.address).collect()
-    }
-
-    fn send_message(&self, node: &Node, msg: &MessageBlock) -> Result<(), std::io::Error> {
-        let mut stream = self.get_connection(&node.address)?;
-        let marshalled = serde_json::to_string(msg)?;
-        stream.write(marshalled.as_bytes())?;
-        Ok(())
+impl Node {
+    pub fn new(address: SocketAddr, timeout: Duration) -> Node {
+        Node { address, timeout }
     }
 
     pub fn get_connection(&self, to: &SocketAddr) -> Result<TcpStream, std::io::Error> {
-        let stream = TcpStream::connect_timeout(to, Duration::from_secs(1))?;
+        let stream = TcpStream::connect_timeout(to, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
 
         Ok(stream)
     }
+}
 
-    pub fn new(port: u16, timeout: Duration) -> Peer {
-        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+impl NodeSender for Node {
+    fn get_addr(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn send_message(
+        &self,
+        node: &impl NodeSender,
+        msg: &MessageBlock<impl NodeSender>,
+    ) -> Result<(), std::io::Error> {
+        let mut stream = self.get_connection(&node.get_addr())?;
+        let marshalled = serde_json::to_string(msg)?;
+        stream.write(marshalled.as_bytes())?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct Peer<T: NodeSender> {
+    body: T,
+    connections: HashSet<T>,
+}
+
+pub trait NodeSender: Eq + Hash + Clone + Debug + std::marker::Send + Serialize {
+    fn get_addr(&self) -> SocketAddr;
+    fn send_message(
+        &self,
+        node: &impl NodeSender,
+        msg: &MessageBlock<impl NodeSender>,
+    ) -> Result<(), std::io::Error>;
+}
+
+impl<T: NodeSender + 'static> Peer<T> {
+    pub fn list_addresses(&self) -> Vec<SocketAddr> {
+        self.connections
+            .iter()
+            .map(|node| node.get_addr())
+            .collect()
+    }
+
+    pub fn new(node: T) -> Peer<T> {
         Peer {
-            connections: HashSet::from([Node::new(address)]),
-            address: address,
-            timeout: timeout,
+            connections: HashSet::from([node.clone()]),
+            body: node,
         }
     }
 
-    fn broadcast(&mut self, msg: &MessageBlock) -> Result<(), Box<dyn std::error::Error>> {
+    fn broadcast(&mut self, msg: &MessageBlock<T>) -> Result<(), Box<dyn std::error::Error>> {
         let broken_connections = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::new();
 
         for node in self.connections.clone() {
-            if node.address != self.address {
+            if node != self.body {
                 let broken_connections = Arc::clone(&broken_connections);
                 let msg = msg.clone();
                 let node_clone = node.clone();
                 let peer = self.clone();
                 let handle = thread::spawn(move || {
-                    if let Err(_) = peer.send_message(&node_clone, &msg) {
+                    if let Err(_) = peer.body.send_message(&node_clone, &msg) {
                         let mut broken = broken_connections.lock().unwrap();
                         broken.push(node_clone);
                     }
@@ -97,40 +118,36 @@ impl Peer {
         Ok(())
     }
 
-    fn update_connections(&mut self, connections: &HashSet<Node>) {
+    fn update_connections(&mut self, connections: &HashSet<T>) {
         self.connections = connections.clone();
     }
 
-    pub fn ask_connections(&self, addr: &SocketAddr) -> Result<(), std::io::Error> {
-        let mut stream = self.get_connection(addr)?;
-        let message = MessageBlock::RequestPeerList(self.address.clone());
-        let marshalled = serde_json::to_string(&message)?;
-        stream.write(marshalled.as_bytes())?;
+    pub fn ask_connections(&self, node: &T) -> Result<(), std::io::Error> {
+        let message = MessageBlock::<T>::RequestPeerList(self.body.clone());
+        self.body.send_message(node, &message)?;
 
         Ok(())
     }
 
-    pub fn send_connections(&self, addr: &SocketAddr) -> Result<(), std::io::Error> {
-        let mut stream = self.get_connection(addr)?;
-        let message = MessageBlock::UpdatePeerList(self.address.clone(), self.connections.clone());
-        let marshalled = serde_json::to_string(&message)?;
-        stream.write(marshalled.as_bytes())?;
+    pub fn send_connections(&self, node: &T) -> Result<(), std::io::Error> {
+        let message = MessageBlock::UpdatePeerList(self.body.clone(), self.connections.clone());
+        self.body.send_message(node, &message)?;
 
         Ok(())
     }
 
-    pub fn joined(&mut self, addr: &SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-        self.notify_join(addr);
-        self.connections.replace(Node::new(addr.clone()));
-        self.send_connections(addr)?;
+    pub fn joined(&mut self, node: &T) -> Result<(), Box<dyn std::error::Error>> {
+        self.notify_join(node);
+        self.connections.replace(node.clone());
+        self.send_connections(node)?;
 
-        self.broadcast(&MessageBlock::PeerJoined(addr.clone()))?;
+        self.broadcast(&MessageBlock::PeerJoined(node.clone()))?;
 
         Ok(())
     }
 
-    pub fn notify_join(&mut self, addr: &SocketAddr) {
-        self.connections.replace(Node::new(addr.clone()));
+    pub fn notify_join(&mut self, node: &T) {
+        self.connections.replace(node.clone());
     }
 
     pub fn generate_message(&self) -> String {
@@ -138,9 +155,25 @@ impl Peer {
         let rnum: i32 = rng.gen_range(0..=100);
         rnum.to_string()
     }
+
+    fn proc_message(&mut self, msg: &MessageBlock<T>) -> Result<(), Box<dyn std::error::Error>> {
+        match msg {
+            MessageBlock::Info(from, data) => {
+                info!("Received message [{data}] from {}", from.get_addr())
+            }
+            MessageBlock::RequestPeerList(from) => self.joined(from)?,
+            MessageBlock::UpdatePeerList(_, peers_data) => self.update_connections(&peers_data),
+            MessageBlock::PeerJoined(from) => self.notify_join(&from),
+        }
+
+        Ok(())
+    }
 }
 
-pub fn talk(peer: Arc<Mutex<Peer>>, period: u64) -> Result<(), Box<dyn std::error::Error>> {
+pub fn talk<N: NodeSender + 'static>(
+    peer: Arc<Mutex<Peer<N>>>,
+    period: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let interval_duration = Duration::from_secs(period);
     loop {
         thread::sleep(interval_duration);
@@ -151,22 +184,25 @@ pub fn talk(peer: Arc<Mutex<Peer>>, period: u64) -> Result<(), Box<dyn std::erro
             .list_addresses()
             .iter()
             .cloned()
-            .filter(|addr| addr != &peer.address)
+            .filter(|addr| addr != &peer.body.get_addr())
             .collect();
 
         info!("Sending message [{msg}] to {peer_list:?}");
 
-        let adress = peer.address.clone();
-        peer.broadcast(&MessageBlock::Info(adress, msg))?;
+        let body = peer.body.clone();
+        peer.broadcast(&MessageBlock::Info(body, msg))?;
     }
 }
 
-pub fn listen(
-    peer: Arc<Mutex<Peer>>,
+pub fn listen<N: NodeSender + 'static>(
+    peer: Arc<Mutex<Peer<N>>>,
     tx: mpsc::Sender<()>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = peer.lock().unwrap().address.clone();
-    let listener = TcpListener::bind(&peer.lock().unwrap().address)?;
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    N: for<'a> Deserialize<'a>,
+{
+    let addr = peer.lock().unwrap().body.get_addr().clone();
+    let listener = TcpListener::bind(addr)?;
     info!("My address is {addr}");
     tx.send(())?;
 
@@ -175,15 +211,10 @@ pub fn listen(
 
         let buf_reader = BufReader::new(&mut stream);
         let mut de = serde_json::Deserializer::from_reader(buf_reader);
-        let req = MessageBlock::deserialize(&mut de)?;
+        let req = MessageBlock::<N>::deserialize(&mut de)?;
 
         let mut peer = peer.lock().unwrap();
-        match req {
-            MessageBlock::Info(from, data) => info!("Received message [{data}] from {from}"),
-            MessageBlock::RequestPeerList(from) => peer.joined(&from)?,
-            MessageBlock::UpdatePeerList(_, peers_data) => peer.update_connections(&peers_data),
-            MessageBlock::PeerJoined(from) => peer.notify_join(&from),
-        }
+        peer.proc_message(&req)?;
     }
 
     Ok(())

@@ -4,6 +4,7 @@ use crate::peer::*;
 use clap::Parser;
 use env_logger::Env;
 use log::info;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,7 +34,10 @@ fn main() {
     let (tx, rx) = mpsc::channel::<()>();
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 
-    let peer = Arc::new(Mutex::new(Peer::new(args.port, DEFAULT_TIMEOUT)));
+    let peer = Arc::new(Mutex::new(Peer::new(Node::new(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port),
+        DEFAULT_TIMEOUT,
+    ))));
     let mut handles = Vec::new();
 
     let peer_sender = Arc::clone(&peer);
@@ -49,7 +53,10 @@ fn main() {
         rx.recv().unwrap();
         let peer = peer_init.lock().unwrap();
         if let Some(conn) = &args.connect {
-            let addr = conn.parse().expect("parse connection string");
+            let addr = Node::new(
+                conn.parse().expect("parse connection string"),
+                DEFAULT_TIMEOUT,
+            );
             peer.ask_connections(&addr).expect("connect");
             info!("Connected to {conn}");
         }
