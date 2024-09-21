@@ -1,11 +1,13 @@
 use log::info;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::io::{BufReader, Write};
 use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -218,4 +220,38 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Eq, PartialEq, Serialize, Deserialize, Debug, Clone)]
+    struct MockNode {
+        get_addr_calls: Cell<u16>,
+        send_messagr_calls: Cell<u16>,
+    }
+
+    impl Hash for MockNode {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.get_addr_calls.get().hash(state);
+        }
+    }
+
+    impl NodeSender for MockNode {
+        fn get_addr(&self) -> SocketAddr {
+            self.get_addr_calls.set(self.get_addr_calls.get() + 1);
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        }
+
+        fn send_message(
+            &self,
+            node: &impl NodeSender,
+            msg: &MessageBlock<impl NodeSender>,
+        ) -> Result<(), std::io::Error> {
+            self.send_messagr_calls
+                .set(self.send_messagr_calls.get() + 1);
+            Ok(())
+        }
+    }
 }
