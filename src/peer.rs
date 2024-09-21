@@ -229,12 +229,23 @@ mod tests {
     #[derive(Eq, PartialEq, Serialize, Deserialize, Debug, Clone)]
     struct MockNode {
         get_addr_calls: Cell<u16>,
-        send_messagr_calls: Cell<u16>,
+        send_message_calls: Cell<u16>,
+        key: u16,
+    }
+
+    impl MockNode {
+        fn new() -> MockNode {
+            MockNode {
+                get_addr_calls: Cell::new(0),
+                send_message_calls: Cell::new(0),
+                key: rand::thread_rng().gen_range(0..100),
+            }
+        }
     }
 
     impl Hash for MockNode {
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-            self.get_addr_calls.get().hash(state);
+            self.key.hash(state);
         }
     }
 
@@ -246,12 +257,24 @@ mod tests {
 
         fn send_message(
             &self,
-            node: &impl NodeSender,
-            msg: &MessageBlock<impl NodeSender>,
+            _: &impl NodeSender,
+            _: &MessageBlock<impl NodeSender>,
         ) -> Result<(), std::io::Error> {
-            self.send_messagr_calls
-                .set(self.send_messagr_calls.get() + 1);
+            self.send_message_calls
+                .set(self.send_message_calls.get() + 1);
             Ok(())
         }
+    }
+
+    #[test]
+    fn broadcast_empty() {
+        let node = MockNode::new();
+        let mut peer = Peer::new(node);
+
+        peer.broadcast(&MessageBlock::Info(peer.body.clone(), "info".to_string()))
+            .unwrap();
+
+        assert!((&peer.body as &MockNode).get_addr_calls.get() == 0);
+        assert!((&peer.body as &MockNode).send_message_calls.get() == 0);
     }
 }
